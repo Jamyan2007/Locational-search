@@ -87,7 +87,49 @@ def rate_limiter():
     }
 
 
+
 def gdelt_request(params):
+    limiter = rate_limiter()
+
+    for attempt in range(3):
+        with limiter["lock"]:
+            delay = 8 - (
+                time.monotonic() - limiter["last"]
+            )
+
+            if delay > 0:
+                time.sleep(delay)
+
+            response = requests.get(
+                GDELT_URL,
+                params=params,
+                headers=HEADERS,
+                timeout=45
+            )
+
+            limiter["last"] = time.monotonic()
+
+        if response.status_code == 429:
+            if attempt == 2:
+                raise RuntimeError(
+                    "GDELT is temporarily limiting requests. "
+                    "Please try again in a few minutes."
+                )
+
+            time.sleep(15 * (attempt + 1))
+            continue
+
+        response.raise_for_status()
+
+        try:
+            return response.json()
+        except ValueError as exc:
+            raise RuntimeError(
+                "GDELT returned an invalid response."
+            ) from exc
+
+    raise RuntimeError("News service temporarily unavailable.")
+
     limiter = rate_limiter()
 
     with limiter["lock"]:
