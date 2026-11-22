@@ -1,74 +1,89 @@
+
 import random
 import re
 import threading
 import time
 
 import pandas as pd
-import plotly.express as px
 import pycountry
 import requests
 import streamlit as st
 
 st.set_page_config(
     page_title="Locational Search",
-    layout="wide",
+    layout="wide"
 )
 
-DOC_URL = "https://api.gdeltproject.org/api/v2/doc/doc"
-GEO_URL = "https://api.gdeltproject.org/api/v2/geo/geo"
-CACHE_TIME = 900
+GEOBOUNDARIES_URL = "https://www.geoboundaries.org/api/current/gbOpen"
+GDELT_URL = "https://api.gdeltproject.org/api/v2/doc/doc"
 
 COUNTRIES = sorted(
-    country.name for country in pycountry.countries
+    [
+        {
+            "name": country.name,
+            "code": country.alpha_3
+        }
+        for country in pycountry.countries
+    ],
+    key=lambda x: x["name"]
 )
 
-BASE_QUERY = (
-    "(election OR government OR parliament OR diplomacy "
-    "OR conflict OR war OR economy OR trade OR climate "
-    "OR earthquake OR wildfire OR technology OR health "
-    "OR science OR migration OR energy OR security)"
-)
+HEADERS = {
+    "User-Agent": "LocationalSearch/1.0"
+}
 
 
 @st.cache_resource
-def request_state():
+def get_rate_limiter():
     return {
-        "last_request": 0.0,
         "lock": threading.Lock(),
+        "last_request": 0.0
     }
 
 
-def api_request(url, params):
-    state = request_state()
+def get_json(url, params=None):
+    response = requests.get(
+        url,
+        params=params,
+        headers=HEADERS,
+        timeout=60
+    )
+    response.raise_for_status()
 
-    with state["lock"]:
-        delay = 5 - (time.monotonic() - state["last_request"])
+    try:
+        return response.json()
+    except ValueError as exc:
+        raise RuntimeError(
+            "The API returned an invalid response."
+        ) from exc
 
-        if delay > 0:
-            time.sleep(delay)
 
-        response = requests.get(
-            url,
-            params=params,
-            timeout=45,
-            headers={"User-Agent": "LocationalSearch/1.0"},
+def gdelt_request(params):
+    limiter = get_rate_limiter()
+
+    with limiter["lock"]:
+        wait = 5 - (
+            time.monotonic() - limiter["last_request"]
         )
 
-        state["last_request"] = time.monotonic()
+        if wait > 0:
+            time.sleep(wait)
+
+        response = requests.get(
+            GDELT_URL,
+            params=params,
+            headers=HEADERS,
+            timeout=60
+        )
+
+        limiter["last_request"] = time.monotonic()
 
     if response.status_code == 429:
         raise RuntimeError(
-            "GDELT rate limit reached. Wait a moment and try again."
+            "GDELT is busy. Please wait and try again."
         )
 
     response.raise_for_status()
-
-    content_type = response.headers.get("Content-Type", "").lower()
-
-    if "json" not in content_type and "geo+json" not in content_type:
-        raise RuntimeError(
-            "GDELT returned an unexpected response. Try again later."
-        )
 
     try:
         return response.json()
@@ -78,98 +93,62 @@ def api_request(url, params):
         ) from exc
 
 
-def country_filter(country):
-    return re.sub(r"\s+", "", country.strip().lower())
-
-
-@st.cache_data(ttl=CACHE_TIME, show_spinner=False)
-def get_regions(country, timespan):
-    query = (
-        f"{BASE_QUERY} "
-        f"locationcc:{country_filter(country)}"
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_regions(country_code):
+    metadata_url = (
+        f"{GEOBOUNDARIES_URL}/{country_code}/ADM1/"
     )
 
-    params = {
-        "query": query,
-        "mode": "adm1",
-        "format": "geojson",
-        "timespan": timespan,
-    }
+    metadata = get_json(metadata_url)
 
-    data = api_request(GEO_URL, params)
+    geojson_url = (
+        metadata.get("simplifiedGeometryGeoJSON")
+        or metadata.get("gjDownloadURL")
+    )
 
-    features = data.get("features", [])
-    results = []
-
-    for feature in features:
-        properties = feature.get("properties") or {}
-
-        name = (
-            properties.get("name")
-            or properties.get("adm1_name")
-            or properties.get("ADM1_NAME")
-            or properties.get("label")
+    if not geojson_url:
+        raise RuntimeError(
+            "No regional map data is available for this country."
         )
 
-        if not name:
-            continue
+    geojson = get_json(geojson_url)
 
-        value = None
+    regions = []
 
-        for field in (
-            "count",
-            "mentions",
-            "share",
-            "percent",
-            "percentage",
-            "value",
-            "score",
-        ):
-            try:
-                raw_value = properties.get(field)
+    for feature in geojson.get("features", []):
+        properties = feature.get("properties", {})
 
-                if raw_value is not None:
-                    value = float(raw_value)
-                    break
-            except (TypeError, ValueError):
-                continue
+        name = (
+            properties.get("shapeName")
+            or properties.get("boundaryName")
+            or properties.get("name")
+            or properties.get("NAME_1")
+            or properties.get("NAME")
+        )
 
-        results.append({
-            "Region": str(name),
-            "GDELT value": value,
-        })
+        if name:
+            regions.append(str(name))
 
-    df = pd.DataFrame(results)
+    regions = sorted(set(regions), key=str.casefold)
 
-    if df.empty:
-        return df
-
-    df = df.drop_duplicates(
-        subset=["Region"]
-    ).reset_index(drop=True)
-
-    if df["GDELT value"].notna().any():
-        df = df.sort_values(
-            "GDELT value",
-            ascending=False,
-            na_position="last",
-        ).reset_index(drop=True)
-
-    df.insert(0, "Rank", range(1, len(df) + 1))
-
-    return df
-
-
-@st.cache_data(ttl=CACHE_TIME, show_spinner=False)
-def get_article_volume(search_query, timespan):
-    params = {
-        "query": search_query,
-        "mode": "TimelineVolRaw",
-        "format": "json",
-        "timespan": timespan,
+    return {
+        "regions": regions,
+        "year": metadata.get("boundaryYearRepresented", "Not specified"),
+        "source": metadata.get("boundarySource", "geoBoundaries"),
+        "count": metadata.get("admUnitCount", len(regions))
     }
 
-    data = api_request(DOC_URL, params)
+
+@st.cache_data(ttl=900, show_spinner=False)
+def get_article_volume(query, timespan):
+    params = {
+        "query": query,
+        "mode": "TimelineVolRaw",
+        "format": "json",
+        "timespan": timespan
+    }
+
+    data = gdelt_request(params)
 
     total = 0
     found = False
@@ -182,24 +161,25 @@ def get_article_volume(search_query, timespan):
                 try:
                     total += int(float(value))
                     found = True
-                except (TypeError, ValueError):
+                except (ValueError, TypeError):
                     pass
 
     return total if found else None
 
 
-@st.cache_data(ttl=CACHE_TIME, show_spinner=False)
-def get_articles(search_query, timespan):
+@st.cache_data(ttl=900, show_spinner=False)
+def get_articles(query, timespan):
     params = {
-        "query": search_query,
+        "query": query,
         "mode": "ArtList",
         "format": "json",
-        "maxrecords": 100,
+        "maxrecords": 50,
         "timespan": timespan,
-        "sort": "DateDesc",
+        "sort": "DateDesc"
     }
 
-    data = api_request(DOC_URL, params)
+    data = gdelt_request(params)
+
     articles = data.get("articles", [])
 
     if not articles:
@@ -209,279 +189,271 @@ def get_articles(search_query, timespan):
 
     df = pd.DataFrame(articles)
 
-    for column in ("title", "domain", "seendate", "url"):
-        if column not in df.columns:
-            df[column] = ""
+    for field in ["title", "domain", "seendate", "url"]:
+        if field not in df.columns:
+            df[field] = ""
 
     df = df.rename(columns={
         "title": "Headline",
         "domain": "Publisher",
         "seendate": "Date",
-        "url": "URL",
+        "url": "URL"
     })
 
     df = df[
         ["Headline", "Publisher", "Date", "URL"]
-    ].copy()
-
-    df = df.fillna("")
-    df = df[df["Headline"].astype(str).str.strip() != ""]
+    ].fillna("")
 
     return df.drop_duplicates(
         subset=["URL", "Headline"]
     )
 
 
-st.markdown(
-    """
-    <style>
-    .block-container {
-        max-width: 1450px;
-        padding-top: 1.6rem;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
 st.title("Locational Search")
 
 st.write(
-    "Explore how countries and their regions appear in recent "
-    "international news coverage."
+    "Explore countries, their regions, and the news coverage "
+    "connected to different locations around the world."
 )
 
-
 with st.sidebar:
-    st.header("Search settings")
+    st.header("Search")
 
-    if st.button("Choose random country", use_container_width=True):
-        st.session_state["country_choice"] = random.choice(COUNTRIES)
-        st.session_state.pop("region_choice", None)
+    if st.button("Random country", use_container_width=True):
+        selected = random.choice(COUNTRIES)
+        st.session_state["country_code"] = selected["code"]
+        st.session_state.pop("selected_region", None)
         st.rerun()
 
-    default_country = st.session_state.get(
-        "country_choice",
-        "Mongolia",
+    default_code = st.session_state.get(
+        "country_code", "MNG"
     )
 
-    if default_country not in COUNTRIES:
-        default_country = "Mongolia"
+    country_codes = [c["code"] for c in COUNTRIES]
+
+    if default_code not in country_codes:
+        default_code = "MNG"
+
+    country_index = country_codes.index(default_code)
 
     country = st.selectbox(
-        "Country",
+        "Choose a country",
         COUNTRIES,
-        index=COUNTRIES.index(default_country),
-        key="country_choice",
+        index=country_index,
+        format_func=lambda c: c["name"],
+        key="country_code"
     )
 
     period_label = st.selectbox(
-        "News coverage period",
+        "News period",
         ["Last 24 hours", "Last 3 days", "Last 7 days"],
-        index=2,
+        index=2
     )
 
     period = {
         "Last 24 hours": "1d",
         "Last 3 days": "3d",
-        "Last 7 days": "7d",
+        "Last 7 days": "7d"
     }[period_label]
 
 
-st.subheader(f"Country overview: {country}")
+country_name = country["name"]
+country_code = country["code"]
 
-st.caption(period_label)
+st.subheader(country_name)
 
-region_error = None
-volume_error = None
+try:
+    with st.spinner(
+        f"Getting regions for {country_name}..."
+    ):
+        regional_data = get_regions(country_code)
 
-with st.spinner("Loading country data..."):
-    try:
-        regions = get_regions(country, period)
-    except (requests.RequestException, RuntimeError) as exc:
-        regions = pd.DataFrame()
-        region_error = str(exc)
+    regions = regional_data["regions"]
 
-    try:
-        country_volume = get_article_volume(
-            f'"{country}"',
-            period,
+    if not regions:
+        st.warning(
+            "No first-level regions were found for this country."
         )
-    except (requests.RequestException, RuntimeError) as exc:
-        country_volume = None
-        volume_error = str(exc)
+        st.stop()
+
+except requests.RequestException as exc:
+    st.error(
+        f"Could not connect to the geographic data service: {exc}"
+    )
+    st.stop()
+
+except (RuntimeError, KeyError, TypeError) as exc:
+    st.error(str(exc))
+    st.stop()
+
+
+try:
+    with st.spinner("Checking country news coverage..."):
+        country_volume = get_article_volume(
+            f'"{country_name}"',
+            period
+        )
+
+except (requests.RequestException, RuntimeError) as exc:
+    country_volume = None
+    st.warning(f"Country news count unavailable: {exc}")
 
 
 col1, col2, col3 = st.columns(3)
 
-col1.metric("Country", country)
+col1.metric("Country", country_name)
 
 col2.metric(
     "Matching news articles",
-    f"{country_volume:,}" if country_volume is not None else "Unavailable",
+    (
+        f"{country_volume:,}"
+        if country_volume is not None
+        else "Unavailable"
+    )
 )
 
-col3.metric(
-    "Regions returned",
-    f"{len(regions):,}" if not regions.empty else "Unavailable",
-)
+col3.metric("Available regions", len(regions))
 
 st.caption(
-    "Article volume measures matching news coverage. "
-    "It does not measure how many people searched online."
+    "News article counts are not the number of people searching online."
 )
 
+st.divider()
 
-if region_error:
-    st.error(region_error)
+st.subheader("Administrative regions")
 
-elif regions.empty:
-    st.info(
-        "No regional results were returned. "
-        "Try another country or a longer time period."
+st.caption(
+    f"First-level regions available: {len(regions)}. "
+    "The first five are shown below in alphabetical order."
+)
+
+if "show_all_regions" not in st.session_state:
+    st.session_state["show_all_regions"] = False
+
+if st.button(
+    "Show all regions"
+    if not st.session_state["show_all_regions"]
+    else "Show first five only"
+):
+    st.session_state["show_all_regions"] = (
+        not st.session_state["show_all_regions"]
+    )
+    st.rerun()
+
+visible_regions = (
+    regions
+    if st.session_state["show_all_regions"]
+    else regions[:5]
+)
+
+region_df = pd.DataFrame({
+    "Region": visible_regions
+})
+
+region_df.insert(
+    0,
+    "Number",
+    range(1, len(region_df) + 1)
+)
+
+st.dataframe(
+    region_df,
+    use_container_width=True,
+    hide_index=True
+)
+
+with st.expander("Geographic data information"):
+    st.write(
+        f"Country code: {country_code}"
+    )
+    st.write(
+        f"Boundary year: {regional_data['year']}"
+    )
+    st.write(
+        f"Data source: {regional_data['source']}"
+    )
+    st.write(
+        "Provider: geoBoundaries"
     )
 
-else:
-    st.subheader("Regional results")
+st.divider()
 
-    if "show_all_regions" not in st.session_state:
-        st.session_state["show_all_regions"] = False
+st.subheader("Search within a region")
 
-    if st.button(
-        "Show all returned regions"
-        if not st.session_state["show_all_regions"]
-        else "Show top five only"
-    ):
-        st.session_state["show_all_regions"] = (
-            not st.session_state["show_all_regions"]
+if st.button("Random region"):
+    st.session_state["selected_region"] = random.choice(regions)
+    st.rerun()
+
+default_region = st.session_state.get(
+    "selected_region",
+    regions[0]
+)
+
+if default_region not in regions:
+    default_region = regions[0]
+
+selected_region = st.selectbox(
+    "Choose a region",
+    regions,
+    index=regions.index(default_region),
+    key="selected_region"
+)
+
+region_query = (
+    f'"{selected_region}" "{country_name}"'
+)
+
+st.markdown(f"### {selected_region}")
+
+try:
+    with st.spinner("Checking regional news coverage..."):
+        region_volume = get_article_volume(
+            region_query,
+            period
         )
-        st.rerun()
 
-    shown_regions = (
-        regions
-        if st.session_state["show_all_regions"]
-        else regions.head(5)
-    )
-
-    display_df = shown_regions.copy()
-
-    display_df["GDELT value"] = display_df[
-        "GDELT value"
-    ].map(
-        lambda value: (
-            round(value, 2)
-            if pd.notna(value)
+    st.metric(
+        "Matching news articles",
+        (
+            f"{region_volume:,}"
+            if region_volume is not None
             else "Unavailable"
         )
     )
 
-    st.dataframe(
-        display_df,
-        use_container_width=True,
-        hide_index=True,
-    )
+except (requests.RequestException, RuntimeError) as exc:
+    st.warning(f"Regional article count unavailable: {exc}")
 
-    chart_data = regions.dropna(
-        subset=["GDELT value"]
-    ).head(15)
 
-    if not chart_data.empty:
-        fig = px.bar(
-            chart_data.sort_values("GDELT value"),
-            x="GDELT value",
-            y="Region",
-            orientation="h",
-            title="Regional coverage ranking",
+try:
+    with st.spinner("Getting news headlines..."):
+        articles = get_articles(
+            region_query,
+            period
         )
 
-        st.plotly_chart(
-            fig,
-            use_container_width=True,
-        )
+    st.markdown("#### Recent headlines")
 
-    st.subheader("Search within a region")
+    if articles.empty:
+        st.info("No matching headlines were found.")
 
-    region_names = regions["Region"].tolist()
+    else:
+        for _, article in articles.head(10).iterrows():
+            headline = article["Headline"]
+            publisher = article["Publisher"]
+            url = article["URL"]
 
-    if st.button("Choose random region"):
-        st.session_state["region_choice"] = random.choice(
-            region_names
-        )
-        st.rerun()
+            if url:
+                st.markdown(
+                    f"- [{headline}]({url}) — {publisher}"
+                )
+            else:
+                st.markdown(
+                    f"- {headline} — {publisher}"
+                )
 
-    default_region = st.session_state.get(
-        "region_choice",
-        region_names[0],
-    )
-
-    if default_region not in region_names:
-        default_region = region_names[0]
-
-    selected_region = st.selectbox(
-        "Select a state, province or region",
-        region_names,
-        index=region_names.index(default_region),
-        key="region_choice",
-    )
-
-    st.markdown(f"#### {selected_region}")
-
-    region_query = (
-        f'"{selected_region}" "{country}"'
-    )
-
-    try:
-        with st.spinner("Searching regional news coverage..."):
-            region_volume = get_article_volume(
-                region_query,
-                period,
-            )
-
-        st.metric(
-            "Matching news articles",
-            (
-                f"{region_volume:,}"
-                if region_volume is not None
-                else "Unavailable"
-            ),
-        )
-
-    except (requests.RequestException, RuntimeError) as exc:
-        st.warning(str(exc))
-
-    try:
-        with st.spinner("Loading example headlines..."):
-            articles = get_articles(
-                region_query,
-                period,
-            )
-
-        if articles.empty:
-            st.info("No matching headlines were returned.")
-
-        else:
-            st.markdown("#### Example headlines")
-
-            for _, article in articles.head(10).iterrows():
-                headline = article["Headline"]
-                publisher = article["Publisher"]
-                url = article["URL"]
-
-                if url:
-                    st.markdown(
-                        f"- [{headline}]({url}) — {publisher}"
-                    )
-                else:
-                    st.markdown(
-                        f"- {headline} — {publisher}"
-                    )
-
-    except (requests.RequestException, RuntimeError) as exc:
-        st.warning(str(exc))
-
-
-if volume_error:
-    st.warning(volume_error)
+except (requests.RequestException, RuntimeError) as exc:
+    st.warning(f"Headlines unavailable: {exc}")
 
 
 st.divider()
@@ -489,20 +461,19 @@ st.divider()
 st.subheader("Topic search")
 
 topic = st.text_input(
-    "Enter a topic or phrase",
-    placeholder="Example: climate change",
+    "Enter a topic",
+    placeholder="Example: artificial intelligence"
 )
 
 if st.button(
     "Search topic",
-    type="primary",
-    disabled=not topic.strip(),
+    disabled=not topic.strip()
 ):
     try:
-        with st.spinner("Searching news coverage..."):
+        with st.spinner("Searching news..."):
             topic_volume = get_article_volume(
                 f'"{topic.strip()}"',
-                period,
+                period
             )
 
         st.metric(
@@ -511,7 +482,7 @@ if st.button(
                 f"{topic_volume:,}"
                 if topic_volume is not None
                 else "Unavailable"
-            ),
+            )
         )
 
     except (requests.RequestException, RuntimeError) as exc:
@@ -519,5 +490,5 @@ if st.button(
 
 
 st.caption(
-    "Data source: GDELT Project DOC 2.0 and GEO 2.0 APIs."
+    "Geographic data: geoBoundaries | News data: GDELT Project"
 )
