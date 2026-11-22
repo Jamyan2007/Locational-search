@@ -1,5 +1,5 @@
 
-import random
+import html
 import re
 import time
 import xml.etree.ElementTree as ET
@@ -11,31 +11,45 @@ import requests
 import streamlit as st
 from streamlit_folium import st_folium
 
+
+# --------------------------------------------------
+# PAGE SETTINGS
+# --------------------------------------------------
+
 st.set_page_config(
     page_title="Locational Search",
+    page_icon="🌍",
     layout="wide",
     initial_sidebar_state="collapsed"
 )
 
-GEO_URL = "https://www.geoboundaries.org/api/current/gbOpen"
+RSS_URL = "https://trends.google.com/trending/rss"
 WORLD_URL = (
     "https://raw.githubusercontent.com/"
     "datasets/geo-countries/master/data/countries.geojson"
 )
-TRENDS_URL = "https://trends.google.com/trending/rss"
+BOUNDARY_URL = "https://www.geoboundaries.org/api/current/gbOpen"
 
 HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 Chrome/130.0 Safari/537.36"
-    )
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                  "AppleWebKit/537.36 Chrome/130.0 Safari/537.36"
 }
 
+# Countries used to build the combined global trends list.
 GLOBAL_COUNTRIES = [
-    "US", "GB", "CA", "AU", "IN",
-    "DE", "FR", "JP", "BR", "MX",
-    "SG", "ZA", "NG", "KR", "MN"
+    "US", "GB", "DE", "IN", "JP",
+    "BR", "CA", "AU", "FR", "NL"
 ]
+
+COUNTRY_NAMES = {
+    country.alpha_2: country.name
+    for country in pycountry.countries
+}
+
+
+# --------------------------------------------------
+# DESIGN
+# --------------------------------------------------
 
 st.markdown("""
 <style>
@@ -43,13 +57,23 @@ st.markdown("""
     background: #080E18;
     color: #E5EDF5;
 }
+
 .block-container {
     max-width: 1900px;
     padding: 1rem 1.2rem;
 }
+
 h1, h2, h3 {
     color: #E5EDF5;
 }
+
+[data-testid="stMetric"] {
+    background: #111C2B;
+    border: 1px solid #26384B;
+    border-radius: 8px;
+    padding: 12px;
+}
+
 .story-card {
     background: #111C2B;
     border: 1px solid #26384B;
@@ -57,68 +81,150 @@ h1, h2, h3 {
     padding: 11px;
     margin-bottom: 9px;
 }
+
 .story-title {
     color: #E5EDF5;
     font-size: 14px;
     font-weight: 600;
+    line-height: 1.5;
 }
+
 .story-meta {
     color: #91A4B8;
     font-size: 11px;
-    margin-top: 5px;
+    margin-top: 6px;
 }
+
+.section-label {
+    color: #73CBE8;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 1px;
+}
+
 [data-testid="stButton"] button {
     background: #142438;
     color: #DCEAF5;
     border: 1px solid #30465D;
     border-radius: 6px;
 }
+
 [data-testid="stButton"] button:hover {
     background: #1B3B54;
     border-color: #4CB9D5;
     color: white;
 }
-[data-testid="stMetric"] {
-    background: #111C2B;
+
+.leaflet-container {
+    background: #0B1420 !important;
     border: 1px solid #26384B;
-    padding: 10px;
     border-radius: 8px;
+}
+
+footer {
+    visibility: hidden;
 }
 </style>
 """, unsafe_allow_html=True)
 
 
-def request_json(url, params=None):
+# --------------------------------------------------
+# HTTP REQUESTS
+# --------------------------------------------------
+
+def fetch(url, params=None, timeout=45):
     response = requests.get(
         url,
         params=params,
         headers=HEADERS,
-        timeout=60
-    )
-    response.raise_for_status()
-    return response.json()
-
-
-def request_xml(url, params=None):
-    response = requests.get(
-        url,
-        params=params,
-        headers=HEADERS,
-        timeout=45
+        timeout=timeout
     )
 
-    if response.status_code == 429:
-        raise RuntimeError("Google Trends is temporarily limiting requests.")
-
     response.raise_for_status()
-    return ET.fromstring(response.content)
+    return response
 
 
-def traffic_number(value):
+# --------------------------------------------------
+# GOOGLE TRENDS RSS
+# --------------------------------------------------
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def get_trends(geo):
+    """
+    Get the current Google Trending Now RSS feed
+    for a country or supported regional location.
+    """
+
+    response = fetch(
+        RSS_URL,
+        params={"geo": geo}
+    )
+
+    root = ET.fromstring(response.content)
+
+    namespace = {
+        "ht": "https://trends.google.com/trending/rss"
+    }
+
+    results = []
+
+    for item in root.findall(".//item"):
+        title = item.findtext("title", default="").strip()
+
+        if not title:
+            continue
+
+        traffic = item.findtext(
+            "ht:approx_traffic",
+            default="",
+            namespaces=namespace
+        )
+
+        news = []
+
+        for news_item in item.findall("ht:news_item", namespace):
+            news_title = news_item.findtext(
+                "ht:news_item_title",
+                default="",
+                namespaces=namespace
+            )
+
+            news_url = news_item.findtext(
+                "ht:news_item_url",
+                default="",
+                namespaces=namespace
+            )
+
+            news_source = news_item.findtext(
+                "ht:news_item_source",
+                default="",
+                namespaces=namespace
+            )
+
+            if news_title:
+                news.append({
+                    "title": news_title,
+                    "url": news_url,
+                    "source": news_source
+                })
+
+        results.append({
+            "topic": title,
+            "traffic": traffic,
+            "news": news,
+            "published": item.findtext("pubDate", default="")
+        })
+
+    return results
+
+
+def traffic_value(value):
+    """Convert approximate traffic labels into sortable numbers."""
+
     if not value:
         return 0
 
-    value = value.upper().replace(",", "").replace("+", "").strip()
+    value = value.upper().replace(",", "").replace("+", "")
 
     match = re.search(r"([\d.]+)\s*([KMB]?)", value)
 
@@ -126,95 +232,53 @@ def traffic_number(value):
         return 0
 
     number = float(match.group(1))
-    suffix = match.group(2)
 
     multiplier = {
         "": 1,
         "K": 1000,
         "M": 1000000,
         "B": 1000000000
-    }.get(suffix, 1)
-
-    return int(number * multiplier)
-
-
-@st.cache_data(ttl=1800, show_spinner=False)
-def get_trends(geo):
-    root = request_xml(
-        TRENDS_URL,
-        {"geo": geo}
-    )
-
-    trends = []
-
-    ns = {
-        "ht": "https://trends.google.com/trending/rss"
     }
 
-    for item in root.findall(".//item"):
-        title = item.findtext("title", default="").strip()
-
-        traffic = item.findtext(
-            "ht:approx_traffic",
-            default="",
-            namespaces=ns
-        )
-
-        if not title:
-            continue
-
-        news_items = []
-
-        for news in item.findall("ht:news_item", ns):
-            news_title = news.findtext(
-                "ht:news_item_title",
-                default="",
-                namespaces=ns
-            )
-
-            news_url = news.findtext(
-                "ht:news_item_url",
-                default="",
-                namespaces=ns
-            )
-
-            if news_title:
-                news_items.append({
-                    "title": news_title,
-                    "url": news_url
-                })
-
-        trends.append({
-            "topic": title,
-            "traffic": traffic,
-            "traffic_number": traffic_number(traffic),
-            "published": item.findtext("pubDate", default=""),
-            "news": news_items,
-            "geo": geo
-        })
-
-    return trends
+    return int(number * multiplier.get(match.group(2), 1))
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+# --------------------------------------------------
+# GLOBAL TOP 10
+# --------------------------------------------------
+
+@st.cache_data(ttl=1800, show_spinner=False)
 def get_global_trends():
+    """
+    Collect trends from multiple countries.
+
+    Topics appearing in more countries rank higher.
+    Approximate traffic is used as a secondary ranking.
+    """
+
     collected = []
 
-    with ThreadPoolExecutor(max_workers=4) as executor:
+    # Keep concurrency low to reduce rate-limit problems.
+    with ThreadPoolExecutor(max_workers=3) as executor:
+
         futures = {
-            executor.submit(get_trends, country): country
-            for country in GLOBAL_COUNTRIES
+            executor.submit(get_trends, code): code
+            for code in GLOBAL_COUNTRIES
         }
 
         for future in as_completed(futures):
-            country = futures[future]
+            code = futures[future]
 
             try:
-                results = future.result()
+                trends = future.result()
 
-                for result in results:
-                    result["country"] = country
-                    collected.append(result)
+                for trend in trends:
+                    trend["country_code"] = code
+                    trend["country_name"] = COUNTRY_NAMES.get(
+                        code, code
+                    )
+
+                    collected.append(trend)
 
             except Exception:
                 continue
@@ -229,15 +293,23 @@ def get_global_trends():
                 "topic": trend["topic"],
                 "countries": set(),
                 "traffic": trend["traffic"],
-                "traffic_number": trend["traffic_number"],
+                "traffic_number": traffic_value(
+                    trend["traffic"]
+                ),
                 "news": trend["news"]
             }
 
-        grouped[key]["countries"].add(trend["country"])
+        grouped[key]["countries"].add(
+            trend["country_code"]
+        )
 
-        if trend["traffic_number"] > grouped[key]["traffic_number"]:
+        current_traffic = traffic_value(
+            trend["traffic"]
+        )
+
+        if current_traffic > grouped[key]["traffic_number"]:
             grouped[key]["traffic"] = trend["traffic"]
-            grouped[key]["traffic_number"] = trend["traffic_number"]
+            grouped[key]["traffic_number"] = current_traffic
 
         if not grouped[key]["news"] and trend["news"]:
             grouped[key]["news"] = trend["news"]
@@ -245,64 +317,123 @@ def get_global_trends():
     results = list(grouped.values())
 
     results.sort(
-        key=lambda x: (
-            len(x["countries"]),
-            x["traffic_number"]
+        key=lambda item: (
+            len(item["countries"]),
+            item["traffic_number"]
         ),
         reverse=True
     )
 
-    return results[:30]
+    return results[:10]
 
+
+# --------------------------------------------------
+# WORLD MAP DATA
+# --------------------------------------------------
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_world():
-    return request_json(WORLD_URL)
+    response = fetch(WORLD_URL, timeout=60)
+    return response.json()
 
+
+# --------------------------------------------------
+# COUNTRY REGIONAL BOUNDARIES
+# --------------------------------------------------
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_regions(country_code):
-    metadata = request_json(
-        f"{GEO_URL}/{country_code}/ADM1/"
+    """
+    Download first-level administrative boundaries
+    for the selected country.
+    """
+
+    metadata_response = fetch(
+        f"{BOUNDARY_URL}/{country_code}/ADM1/"
     )
 
-    geojson_url = (
+    metadata = metadata_response.json()
+
+    geometry_url = (
         metadata.get("simplifiedGeometryGeoJSON")
         or metadata.get("gjDownloadURL")
     )
 
-    if not geojson_url:
-        raise RuntimeError("Regional map data is unavailable.")
+    if not geometry_url:
+        raise RuntimeError(
+            "Regional boundaries are not available."
+        )
 
-    geojson = request_json(geojson_url)
+    geometry_response = fetch(
+        geometry_url,
+        timeout=60
+    )
 
-    return metadata, geojson
+    return geometry_response.json()
 
 
-def find_country(properties):
-    for field in ["ISO_A3", "ADM0_A3", "ISO_A3_EH"]:
+# --------------------------------------------------
+# COUNTRY IDENTIFICATION
+# --------------------------------------------------
+
+def identify_country(properties):
+    """
+    Read ISO country codes from the world map.
+    """
+
+    code_fields = [
+        "ISO_A3",
+        "ADM0_A3",
+        "ISO_A3_EH",
+        "SOV_A3"
+    ]
+
+    for field in code_fields:
         code = properties.get(field)
 
         if code and code != "-99":
-            country = pycountry.countries.get(alpha_3=code)
+            country = pycountry.countries.get(
+                alpha_3=code
+            )
 
             if country:
-                return country.name, country.alpha_2, country.alpha_3
+                return {
+                    "name": country.name,
+                    "alpha2": country.alpha_2,
+                    "alpha3": country.alpha_3
+                }
 
-    for field in ["ADMIN", "name", "NAME", "SOVEREIGNT"]:
+    name_fields = [
+        "ADMIN",
+        "name",
+        "NAME",
+        "SOVEREIGNT"
+    ]
+
+    for field in name_fields:
         name = properties.get(field)
 
         if name:
             try:
                 country = pycountry.countries.lookup(name)
-                return country.name, country.alpha_2, country.alpha_3
+
+                return {
+                    "name": country.name,
+                    "alpha2": country.alpha_2,
+                    "alpha3": country.alpha_3
+                }
+
             except LookupError:
-                pass
+                continue
 
-    return None, None, None
+    return None
 
 
-def get_name(properties):
+# --------------------------------------------------
+# REGION IDENTIFICATION
+# --------------------------------------------------
+
+def region_name(properties):
     for field in [
         "shapeName",
         "boundaryName",
@@ -316,150 +447,244 @@ def get_name(properties):
     return None
 
 
-def coordinates_average(geometry):
+def region_google_code(properties, country_code):
+    """
+    Find the ISO 3166-2 regional code where available.
+    Example: US-CA for California.
+
+    Google may not support every regional code.
+    """
+
+    possible_fields = [
+        "shapeISO",
+        "shapeISO2",
+        "ISO_3166_2",
+        "iso_3166_2"
+    ]
+
+    for field in possible_fields:
+        value = properties.get(field)
+
+        if value and "-" in str(value):
+            return str(value).upper()
+
+    return None
+
+
+# --------------------------------------------------
+# MAP HELPERS
+# --------------------------------------------------
+
+def average_coordinates(geometry):
+    """
+    Calculate a simple average coordinate for a feature.
+    Used to place clickable map markers.
+    """
+
     points = []
 
-    def walk(value):
+    def collect(value):
         if (
             isinstance(value, list)
             and len(value) >= 2
-            and isinstance(value[0], (float, int))
-            and isinstance(value[1], (float, int))
+            and isinstance(value[0], (int, float))
+            and isinstance(value[1], (int, float))
         ):
             points.append((value[1], value[0]))
+
         elif isinstance(value, list):
             for child in value:
-                walk(child)
+                collect(child)
 
     if geometry:
-        walk(geometry.get("coordinates", []))
+        collect(geometry.get("coordinates", []))
 
     if not points:
         return None
 
     return (
-        sum(p[0] for p in points) / len(points),
-        sum(p[1] for p in points) / len(points)
+        sum(point[0] for point in points) / len(points),
+        sum(point[1] for point in points) / len(points)
     )
 
 
-def add_click_markers(map_object, geojson, level):
+def add_country_markers(map_object, geojson):
+    """
+    Add clickable points for countries.
+    The country boundaries themselves remain visible.
+    """
+
+    for feature in geojson.get("features", []):
+        properties = feature.get("properties", {})
+        country = identify_country(properties)
+
+        if not country:
+            continue
+
+        center = average_coordinates(
+            feature.get("geometry")
+        )
+
+        if not center:
+            continue
+
+        tooltip = (
+            f"{country['name']}|"
+            f"{country['alpha2']}|"
+            f"{country['alpha3']}"
+        )
+
+        folium.CircleMarker(
+            location=center,
+            radius=10,
+            color="#75D8F2",
+            weight=1,
+            fill=True,
+            fill_color="#75D8F2",
+            fill_opacity=0.08,
+            opacity=0.35,
+            tooltip=tooltip
+        ).add_to(map_object)
+
+
+def add_region_markers(map_object, geojson, country_code):
+    """
+    Add clickable points for states or provinces.
+    """
+
     for feature in geojson.get("features", []):
         properties = feature.get("properties", {})
 
-        if level == "country":
-            name, alpha2, alpha3 = find_country(properties)
+        name = region_name(properties)
 
-            if not name:
-                continue
+        if not name:
+            continue
 
-            tooltip = f"{name}|{alpha2}|{alpha3}"
+        center = average_coordinates(
+            feature.get("geometry")
+        )
 
-        else:
-            name = get_name(properties)
+        if not center:
+            continue
 
-            if not name:
-                continue
+        google_code = region_google_code(
+            properties,
+            country_code
+        )
 
-            code = (
-                properties.get("shapeISO")
-                or properties.get("shapeISO2")
-                or ""
-            )
+        tooltip = (
+            f"{name}|{google_code or ''}"
+        )
 
-            tooltip = f"{name}|{code}"
-
-        center = coordinates_average(feature.get("geometry"))
-
-        if center:
-            folium.CircleMarker(
-                location=center,
-                radius=8,
-                color="#6ED9F3",
-                weight=1,
-                fill=True,
-                fill_color="#6ED9F3",
-                fill_opacity=0.01,
-                opacity=0.01,
-                tooltip=tooltip
-            ).add_to(map_object)
+        folium.CircleMarker(
+            location=center,
+            radius=10,
+            color="#8DE2F8",
+            weight=1,
+            fill=True,
+            fill_color="#8DE2F8",
+            fill_opacity=0.08,
+            opacity=0.4,
+            tooltip=tooltip
+        ).add_to(map_object)
 
 
-def map_style(map_object):
-    map_object.get_root().html.add_child(
+# --------------------------------------------------
+# MAP CREATION
+# --------------------------------------------------
+
+def create_world_map(world):
+    """
+    Draw the world without external map tiles.
+    This removes Carto API-key watermarks.
+    """
+
+    m = folium.Map(
+        location=[20, 0],
+        zoom_start=2,
+        tiles=None,
+        control_scale=True,
+        prefer_canvas=True
+    )
+
+    m.get_root().html.add_child(
         folium.Element("""
         <style>
-        .leaflet-tile-pane {
-            filter: invert(90%) hue-rotate(180deg)
-                    brightness(85%) contrast(90%);
+        .leaflet-container {
+            background: #0B1420 !important;
         }
         </style>
         """)
     )
 
-
-def world_map(world):
-    m = folium.Map(
-        location=[20, 0],
-        zoom_start=2,
-        tiles="OpenStreetMap",
-        prefer_canvas=True,
-        control_scale=True
-    )
-
     folium.GeoJson(
         world,
-        style_function=lambda f: {
-            "fillColor": "#193C53",
-            "color": "#5BBAD8",
+        name="Countries",
+        style_function=lambda feature: {
+            "fillColor": "#173B52",
+            "color": "#4E9DB9",
             "weight": 0.65,
-            "fillOpacity": 0.25
+            "fillOpacity": 0.7
         },
-        highlight_function=lambda f: {
-            "fillColor": "#168DB2",
-            "color": "#B5EEFF",
+        highlight_function=lambda feature: {
+            "fillColor": "#1B789B",
+            "color": "#A8EDFF",
             "weight": 2,
-            "fillOpacity": 0.65
+            "fillOpacity": 0.9
         }
     ).add_to(m)
 
-    add_click_markers(m, world, "country")
-    map_style(m)
+    add_country_markers(m, world)
 
     return m
 
 
-def region_map(geojson):
+def create_region_map(geojson):
+    """
+    Draw the selected country's administrative divisions.
+    """
+
     m = folium.Map(
         location=[20, 0],
         zoom_start=4,
-        tiles="OpenStreetMap",
-        prefer_canvas=True,
-        control_scale=True
+        tiles=None,
+        control_scale=True,
+        prefer_canvas=True
+    )
+
+    m.get_root().html.add_child(
+        folium.Element("""
+        <style>
+        .leaflet-container {
+            background: #0B1420 !important;
+        }
+        </style>
+        """)
     )
 
     folium.GeoJson(
         geojson,
-        style_function=lambda f: {
-            "fillColor": "#155D83",
-            "color": "#76C9E5",
+        name="States and regions",
+        style_function=lambda feature: {
+            "fillColor": "#15516E",
+            "color": "#65C7E7",
             "weight": 1.2,
-            "fillOpacity": 0.45
+            "fillOpacity": 0.75
         },
-        highlight_function=lambda f: {
-            "fillColor": "#21A2C4",
-            "color": "#B1F1FF",
+        highlight_function=lambda feature: {
+            "fillColor": "#218FB5",
+            "color": "#C1F2FF",
             "weight": 2.5,
-            "fillOpacity": 0.8
+            "fillOpacity": 0.95
         }
     ).add_to(m)
-
-    add_click_markers(m, geojson, "region")
 
     bounds = []
 
     for feature in geojson.get("features", []):
-        center = coordinates_average(feature.get("geometry"))
+        center = average_coordinates(
+            feature.get("geometry")
+        )
 
         if center:
             bounds.append(center)
@@ -467,25 +692,36 @@ def region_map(geojson):
     if bounds:
         m.fit_bounds(bounds)
 
-    map_style(m)
-
     return m
 
 
-def render_trend(trend, number=None):
-    title = trend["topic"]
-    traffic = trend.get("traffic", "")
+# --------------------------------------------------
+# DISPLAY SEARCH RESULTS
+# --------------------------------------------------
+
+def display_trend(trend, number=None):
+    topic = html.escape(str(trend["topic"]))
+    traffic = html.escape(str(trend.get("traffic") or "Not available"))
+
     countries = trend.get("countries", set())
+
+    country_count = len(countries)
+
+    number_text = (
+        f"{number}. "
+        if number is not None
+        else ""
+    )
 
     st.markdown(
         f"""
         <div class="story-card">
             <div class="story-title">
-                {f"{number}. " if number else ""}{title}
+                {number_text}{topic}
             </div>
             <div class="story-meta">
-                {traffic if traffic else "Traffic unavailable"}
-                {(" · " + str(len(countries)) + " countries") if countries else ""}
+                Approx. traffic: {traffic}
+                {" · Appears in " + str(country_count) + " countries" if countries else ""}
             </div>
         </div>
         """,
@@ -493,21 +729,35 @@ def render_trend(trend, number=None):
     )
 
 
-if "country" not in st.session_state:
-    st.session_state.country = None
+# --------------------------------------------------
+# SESSION STATE
+# --------------------------------------------------
 
-if "region" not in st.session_state:
-    st.session_state.region = None
+if "selected_country" not in st.session_state:
+    st.session_state.selected_country = None
+
+if "selected_region" not in st.session_state:
+    st.session_state.selected_region = None
 
 if "show_ten" not in st.session_state:
     st.session_state.show_ten = False
 
-if "map_level" not in st.session_state:
-    st.session_state.map_level = "world"
+
+# --------------------------------------------------
+# HEADER
+# --------------------------------------------------
+
+st.markdown("# LOCATIONAL SEARCH")
+st.caption(
+    "EXPLORE WHAT PEOPLE ARE SEARCHING FOR AROUND THE WORLD"
+)
+
+st.divider()
 
 
-st.markdown("## LOCATIONAL SEARCH")
-st.caption("LIVE SEARCH TRENDS BY LOCATION")
+# --------------------------------------------------
+# THREE-PANEL LAYOUT
+# --------------------------------------------------
 
 left, center, right = st.columns(
     [1.05, 2.7, 1.15],
@@ -515,226 +765,367 @@ left, center, right = st.columns(
 )
 
 
+# --------------------------------------------------
+# LEFT: GLOBAL TOP 10
+# --------------------------------------------------
+
 with left:
-    st.markdown("### GLOBAL TRENDING SEARCHES")
 
-    st.caption("Combined trends from selected countries")
+    st.markdown("### GLOBAL TOP 10 SEARCHES")
 
-    search_filter = st.text_input(
-        "Filter topics",
-        placeholder="Find a trend..."
+    st.caption(
+        "Combined live trends from multiple countries"
     )
 
     try:
-        with st.spinner("Collecting global trends..."):
+        with st.spinner("Collecting global searches..."):
             global_trends = get_global_trends()
 
-        if search_filter:
-            global_trends = [
-                t for t in global_trends
-                if search_filter.casefold() in t["topic"].casefold()
-            ]
-
-        for index, trend in enumerate(global_trends[:10], 1):
-            render_trend(trend, index)
-
         if not global_trends:
-            st.info("No trends are available right now.")
+            st.warning(
+                "Global search trends are temporarily unavailable."
+            )
 
-    except Exception as exc:
-        st.error(f"Global trends unavailable: {exc}")
+        else:
+            for index, trend in enumerate(
+                global_trends[:10],
+                start=1
+            ):
+                display_trend(trend, index)
 
+    except Exception:
+        st.warning(
+            "Could not load global searches. "
+            "Please try again later."
+        )
+
+
+# --------------------------------------------------
+# CENTER: INTERACTIVE MAP
+# --------------------------------------------------
 
 with center:
-    if st.session_state.country:
-        country = st.session_state.country
 
-        map_title, map_button = st.columns([3, 1])
+    selected_country = st.session_state.selected_country
 
-        with map_title:
-            st.markdown(f"### {country['name']}")
+    if selected_country:
 
-        with map_button:
-            if st.button("World map"):
-                st.session_state.country = None
-                st.session_state.region = None
-                st.session_state.map_level = "world"
+        title_col, button_col = st.columns([3, 1])
+
+        with title_col:
+            st.markdown(
+                f"### {selected_country['name']}"
+            )
+
+        with button_col:
+            if st.button(
+                "World map",
+                use_container_width=True
+            ):
+                st.session_state.selected_country = None
+                st.session_state.selected_region = None
+                st.session_state.show_ten = False
                 st.rerun()
 
         try:
-            with st.spinner("Loading regional boundaries..."):
-                metadata, geojson = get_regions(country["alpha3"])
+            with st.spinner("Loading state and province boundaries..."):
 
-            m = region_map(geojson)
+                regional_data = get_regions(
+                    selected_country["alpha3"]
+                )
 
-            map_result = st_folium(
-                m,
-                height=690,
-                width=None,
-                key=f"regions_{country['alpha3']}",
-                returned_objects=["last_object_clicked_tooltip"]
+            regional_map = create_region_map(
+                regional_data
             )
 
-            clicked = map_result.get("last_object_clicked_tooltip")
+            map_result = st_folium(
+                regional_map,
+                height=690,
+                width=None,
+                key=f"regional_map_{selected_country['alpha3']}",
+                returned_objects=[
+                    "last_object_clicked_tooltip"
+                ]
+            )
+
+            clicked = map_result.get(
+                "last_object_clicked_tooltip"
+            )
 
             if clicked and "|" in clicked:
-                region_name, region_code = clicked.split("|", 1)
 
-                if region_name != st.session_state.region:
-                    st.session_state.region = {
-                        "name": region_name,
-                        "code": region_code.strip()
-                    }
+                name, google_code = clicked.split("|", 1)
+
+                new_region = {
+                    "name": name,
+                    "google_code": google_code.strip() or None
+                }
+
+                if new_region != st.session_state.selected_region:
+                    st.session_state.selected_region = new_region
+                    st.session_state.show_ten = False
                     st.rerun()
 
         except Exception as exc:
-            st.error(f"Regional map unavailable: {exc}")
+
+            st.error(
+                "Could not load this country's regional map."
+            )
+
+            st.caption(str(exc))
 
     else:
+
         st.markdown("### WORLD MAP")
 
         try:
             world = get_world()
-            m = world_map(world)
+
+            world_map = create_world_map(world)
 
             map_result = st_folium(
-                m,
+                world_map,
                 height=690,
                 width=None,
-                key="world_map",
-                returned_objects=["last_object_clicked_tooltip"]
+                key="main_world_map",
+                returned_objects=[
+                    "last_object_clicked_tooltip"
+                ]
             )
 
-            clicked = map_result.get("last_object_clicked_tooltip")
+            clicked = map_result.get(
+                "last_object_clicked_tooltip"
+            )
 
             if clicked and "|" in clicked:
+
                 name, alpha2, alpha3 = clicked.split("|", 2)
 
-                if alpha2 and alpha3:
-                    st.session_state.country = {
-                        "name": name,
-                        "alpha2": alpha2,
-                        "alpha3": alpha3
-                    }
-                    st.session_state.region = None
-                    st.session_state.map_level = "country"
+                new_country = {
+                    "name": name,
+                    "alpha2": alpha2,
+                    "alpha3": alpha3
+                }
+
+                if new_country != st.session_state.selected_country:
+                    st.session_state.selected_country = new_country
+                    st.session_state.selected_region = None
+                    st.session_state.show_ten = False
                     st.rerun()
 
         except Exception as exc:
-            st.error(f"World map unavailable: {exc}")
 
+            st.error("Could not load the world map.")
+
+            st.caption(str(exc))
+
+
+# --------------------------------------------------
+# RIGHT: SELECTED LOCATION SEARCHES
+# --------------------------------------------------
 
 with right:
-    if not st.session_state.country:
+
+    selected_country = st.session_state.selected_country
+    selected_region = st.session_state.selected_region
+
+    if not selected_country:
+
         st.markdown("### LOCATION")
+
         st.divider()
-        st.write("Click a country on the map to explore its searches.")
+
+        st.write(
+            "Select a country on the map to explore "
+            "its trending searches."
+        )
 
     else:
-        country = st.session_state.country
 
-        if st.session_state.region:
-            location_name = st.session_state.region["name"]
-            region_code = st.session_state.region["code"]
+        if selected_region:
 
-            st.markdown("### SELECTED STATE / REGION")
+            location_name = selected_region["name"]
+
+            google_geo = selected_region["google_code"]
+
+            st.markdown("### SELECTED REGION")
+
             st.markdown(f"## {location_name}")
-            st.caption(country["name"])
 
-            if st.button("Back to country trends"):
-                st.session_state.region = None
+            st.caption(selected_country["name"])
+
+            if st.button(
+                "Back to country",
+                use_container_width=True
+            ):
+                st.session_state.selected_region = None
+                st.session_state.show_ten = False
                 st.rerun()
 
-            if region_code and "-" in region_code:
-                trend_geo = region_code
-            else:
-                trend_geo = None
-
         else:
-            location_name = country["name"]
-            trend_geo = country["alpha2"]
+
+            location_name = selected_country["name"]
+
+            google_geo = selected_country["alpha2"]
 
             st.markdown("### COUNTRY")
+
             st.markdown(f"## {location_name}")
-            st.caption(country["alpha2"])
+
+            st.caption(selected_country["alpha2"])
 
         st.divider()
 
-        if trend_geo:
+        if not google_geo:
+
+            st.info(
+                "A separate Google Trends feed is not available "
+                "for this region."
+            )
+
+        else:
+
             try:
-                with st.spinner("Loading location trends..."):
-                    local_trends = get_trends(trend_geo)
+
+                with st.spinner(
+                    f"Loading searches for {location_name}..."
+                ):
+
+                    local_trends = get_trends(google_geo)
 
                 if not local_trends:
+
                     st.info(
-                        "Google Trends has no separate trending feed "
+                        "No trending searches were returned "
                         "for this location."
                     )
 
                 else:
-                    visible = (
-                        local_trends[:10]
+
+                    st.markdown("### TOP SEARCHES")
+
+                    visible_count = (
+                        10
                         if st.session_state.show_ten
-                        else local_trends[:5]
+                        else 5
                     )
 
-                    st.markdown("### TRENDING SEARCHES")
-
-                    for index, trend in enumerate(visible, 1):
-                        render_trend(trend, index)
+                    for index, trend in enumerate(
+                        local_trends[:visible_count],
+                        start=1
+                    ):
+                        display_trend(trend, index)
 
                     if len(local_trends) > 5:
+
                         if st.button(
-                            "Show top 10" if not st.session_state.show_ten
-                            else "Show top 5"
+                            "Show top 5" if st.session_state.show_ten
+                            else "Show top 10",
+                            use_container_width=True
                         ):
+
                             st.session_state.show_ten = (
                                 not st.session_state.show_ten
                             )
+
                             st.rerun()
 
                     st.divider()
 
+                    st.markdown("### RELATED NEWS")
+
+                    topics = [
+                        trend["topic"]
+                        for trend in local_trends
+                    ]
+
                     selected_topic = st.selectbox(
-                        "Choose a trending topic",
-                        [t["topic"] for t in local_trends]
+                        "Select a trending search",
+                        topics,
+                        label_visibility="collapsed"
                     )
 
-                    selected = next(
-                        t for t in local_trends
-                        if t["topic"] == selected_topic
+                    selected_trend = next(
+                        trend
+                        for trend in local_trends
+                        if trend["topic"] == selected_topic
                     )
 
-                    st.markdown("#### RELATED NEWS")
+                    if selected_trend["news"]:
 
-                    if selected["news"]:
-                        for item in selected["news"][:3]:
-                            if item["url"]:
+                        for article in selected_trend["news"][:3]:
+
+                            article_title = article["title"]
+                            article_url = article["url"]
+                            article_source = article["source"]
+
+                            if article_url:
                                 st.markdown(
-                                    f"[{item['title']}]({item['url']})"
+                                    f"[{article_title}]({article_url})"
                                 )
                             else:
-                                st.write(item["title"])
+                                st.write(article_title)
+
+                            if article_source:
+                                st.caption(article_source)
+
                     else:
-                        st.caption("No related news supplied.")
 
-            except Exception as exc:
-                st.warning(
-                    "Separate search trends are unavailable "
-                    f"for this location: {exc}"
+                        st.caption(
+                            "No related news articles were provided."
+                        )
+
+            except requests.HTTPError as exc:
+
+                status = (
+                    exc.response.status_code
+                    if exc.response is not None
+                    else "unknown"
                 )
-        else:
-            st.info(
-                "This region does not have a separate Google Trends "
-                "location code. Country-level trends are not being "
-                "presented as regional results."
-            )
 
+                if status == 400:
+
+                    st.info(
+                        "Google Trends does not provide a trending "
+                        "search feed for this location."
+                    )
+
+                elif status == 429:
+
+                    st.warning(
+                        "Google Trends is temporarily limiting requests. "
+                        "Please wait and try again."
+                    )
+
+                else:
+
+                    st.warning(
+                        "Search data is temporarily unavailable."
+                    )
+
+            except requests.RequestException:
+
+                st.warning(
+                    "Could not connect to Google Trends. "
+                    "Please try again later."
+                )
+
+            except Exception:
+
+                st.warning(
+                    "Search data is temporarily unavailable."
+                )
+
+
+# --------------------------------------------------
+# FOOTER
+# --------------------------------------------------
 
 st.divider()
 
 st.caption(
-    "Search trend source: Google Trends RSS. "
-    "Geographic boundaries: geoBoundaries. "
+    "Search data: Google Trends Trending Now RSS. "
+    "Map boundaries: geoBoundaries. "
+    "Global ranking is an aggregation of selected country feeds. "
     "Traffic figures are approximate, not exact search counts."
 )
