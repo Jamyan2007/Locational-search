@@ -1,6 +1,5 @@
-import html
+
 import re
-import time
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -34,7 +33,6 @@ HEADERS = {
                   "AppleWebKit/537.36 Chrome/130.0 Safari/537.36"
 }
 
-# Countries used to build the combined global trends list.
 GLOBAL_COUNTRIES = [
     "US", "GB", "DE", "IN", "JP",
     "BR", "CA", "AU", "FR", "NL"
@@ -257,7 +255,6 @@ def get_global_trends():
 
     collected = []
 
-    # Keep concurrency low to reduce rate-limit problems.
     with ThreadPoolExecutor(max_workers=3) as executor:
 
         futures = {
@@ -450,8 +447,6 @@ def region_google_code(properties, country_code):
     """
     Find the ISO 3166-2 regional code where available.
     Example: US-CA for California.
-
-    Google may not support every regional code.
     """
 
     possible_fields = [
@@ -465,7 +460,17 @@ def region_google_code(properties, country_code):
         value = properties.get(field)
 
         if value and "-" in str(value):
-            return str(value).upper()
+            value = str(value).upper()
+            prefix, suffix = value.split("-", 1)
+
+            country = pycountry.countries.get(
+                alpha_3=country_code
+            )
+
+            if country and prefix == country.alpha_3:
+                value = f"{country.alpha_2}-{suffix}"
+
+            return value
 
     return None
 
@@ -477,7 +482,7 @@ def region_google_code(properties, country_code):
 def average_coordinates(geometry):
     """
     Calculate a simple average coordinate for a feature.
-    Used to place clickable map markers.
+    Used to calculate the map bounds.
     """
 
     points = []
@@ -507,85 +512,38 @@ def average_coordinates(geometry):
     )
 
 
-def add_country_markers(map_object, geojson):
+def prepare_country_features(geojson):
     """
-    Add clickable points for countries.
-    The country boundaries themselves remain visible.
-    """
-
-    for feature in geojson.get("features", []):
-        properties = feature.get("properties", {})
-        country = identify_country(properties)
-
-        if not country:
-            continue
-
-        center = average_coordinates(
-            feature.get("geometry")
-        )
-
-        if not center:
-            continue
-
-        tooltip = (
-            f"{country['name']}|"
-            f"{country['alpha2']}|"
-            f"{country['alpha3']}"
-        )
-
-        folium.CircleMarker(
-            location=center,
-            radius=10,
-            color="#75D8F2",
-            weight=1,
-            fill=True,
-            fill_color="#75D8F2",
-            fill_opacity=0.08,
-            opacity=0.35,
-            tooltip=tooltip
-        ).add_to(map_object)
-
-
-def add_region_markers(map_object, geojson, country_code):
-    """
-    Add clickable points for states or provinces.
+    Add a readable hover label to each country polygon.
+    The polygon itself is the click target.
     """
 
     for feature in geojson.get("features", []):
-        properties = feature.get("properties", {})
-
-        name = region_name(properties)
-
-        if not name:
-            continue
-
-        center = average_coordinates(
-            feature.get("geometry")
+        country = identify_country(
+            feature.get("properties", {})
         )
 
-        if not center:
-            continue
+        if country:
+            feature.setdefault("properties", {})[
+                "_map_label"
+            ] = country["name"]
 
-        google_code = region_google_code(
-            properties,
-            country_code
+
+def prepare_region_features(geojson):
+    """
+    Add a readable hover label to each state/province polygon.
+    The polygon itself is the click target.
+    """
+
+    for feature in geojson.get("features", []):
+        name = region_name(
+            feature.get("properties", {})
         )
 
-        tooltip = (
-            f"{name}|{google_code or ''}"
-        )
-
-        folium.CircleMarker(
-            location=center,
-            radius=10,
-            color="#8DE2F8",
-            weight=1,
-            fill=True,
-            fill_color="#8DE2F8",
-            fill_opacity=0.08,
-            opacity=0.4,
-            tooltip=tooltip
-        ).add_to(map_object)
+        if name:
+            feature.setdefault("properties", {})[
+                "_map_label"
+            ] = name
 
 
 # --------------------------------------------------
@@ -616,9 +574,18 @@ def create_world_map(world):
         """)
     )
 
+    prepare_country_features(world)
+
     folium.GeoJson(
         world,
         name="Countries",
+        tooltip=folium.GeoJsonTooltip(
+            fields=["_map_label"],
+            aliases=["Country:"],
+            sticky=True,
+            style="background-color: #111C2B; color: #E5EDF5; "
+                  "border: 1px solid #4E9DB9; border-radius: 4px;"
+        ),
         style_function=lambda feature: {
             "fillColor": "#173B52",
             "color": "#4E9DB9",
@@ -632,8 +599,6 @@ def create_world_map(world):
             "fillOpacity": 0.9
         }
     ).add_to(m)
-
-    add_country_markers(m, world)
 
     return m
 
@@ -661,9 +626,18 @@ def create_region_map(geojson):
         """)
     )
 
+    prepare_region_features(geojson)
+
     folium.GeoJson(
         geojson,
         name="States and regions",
+        tooltip=folium.GeoJsonTooltip(
+            fields=["_map_label"],
+            aliases=["State / region:"],
+            sticky=True,
+            style="background-color: #111C2B; color: #E5EDF5; "
+                  "border: 1px solid #65C7E7; border-radius: 4px;"
+        ),
         style_function=lambda feature: {
             "fillColor": "#15516E",
             "color": "#65C7E7",
@@ -699,33 +673,22 @@ def create_region_map(geojson):
 # --------------------------------------------------
 
 def display_trend(trend, number=None):
-    topic = html.escape(str(trend["topic"]))
-    traffic = html.escape(str(trend.get("traffic") or "Not available"))
-
+    topic = str(trend.get("topic", ""))
+    traffic = str(trend.get("traffic") or "Not available")
     countries = trend.get("countries", set())
-
     country_count = len(countries)
 
-    number_text = (
-        f"{number}. "
-        if number is not None
-        else ""
-    )
+    number_text = f"{number}. " if number is not None else ""
 
-    st.markdown(
-        f"""
-        <div class="story-card">
-            <div class="story-title">
-                {number_text}{topic}
-            </div>
-            <div class="story-meta">
-                Approx. traffic: {traffic}
-                {" · Appears in " + str(country_count) + " countries" if countries else ""}
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True
-    )
+    with st.container(border=True):
+        st.markdown(f"**{number_text}{topic}**")
+
+        meta = f"Approx. traffic: {traffic}"
+
+        if countries:
+            meta += f" · Appears in {country_count} countries"
+
+        st.caption(meta)
 
 
 # --------------------------------------------------
@@ -747,6 +710,7 @@ if "show_ten" not in st.session_state:
 # --------------------------------------------------
 
 st.markdown("# LOCATIONAL SEARCH")
+
 st.caption(
     "EXPLORE WHAT PEOPLE ARE SEARCHING FOR AROUND THE WORLD"
 )
@@ -827,7 +791,9 @@ with center:
                 st.rerun()
 
         try:
-            with st.spinner("Loading state and province boundaries..."):
+            with st.spinner(
+                "Loading state and province boundaries..."
+            ):
 
                 regional_data = get_regions(
                     selected_country["alpha3"]
@@ -842,25 +808,40 @@ with center:
                 height=690,
                 width=None,
                 key=f"regional_map_{selected_country['alpha3']}",
-                returned_objects=[
-                    "last_object_clicked_tooltip"
-                ]
+                returned_objects=["last_active_drawing"]
             )
 
-            clicked = map_result.get(
-                "last_object_clicked_tooltip"
+            active_feature = (
+                map_result.get("last_active_drawing") or {}
             )
 
-            if clicked and "|" in clicked:
+            properties = (
+                active_feature.get("properties", {})
+                if isinstance(active_feature, dict)
+                else {}
+            )
 
-                name, google_code = clicked.split("|", 1)
+            name = (
+                region_name(properties)
+                if properties
+                else None
+            )
+
+            if name:
+                google_code = region_google_code(
+                    properties,
+                    selected_country["alpha3"]
+                )
 
                 new_region = {
                     "name": name,
-                    "google_code": google_code.strip() or None
+                    "google_code": google_code
                 }
 
-                if new_region != st.session_state.selected_region:
+                if (
+                    new_region
+                    != st.session_state.selected_region
+                ):
                     st.session_state.selected_region = new_region
                     st.session_state.show_ten = False
                     st.rerun()
@@ -887,26 +868,32 @@ with center:
                 height=690,
                 width=None,
                 key="main_world_map",
-                returned_objects=[
-                    "last_object_clicked_tooltip"
-                ]
+                returned_objects=["last_active_drawing"]
             )
 
-            clicked = map_result.get(
-                "last_object_clicked_tooltip"
+            active_feature = (
+                map_result.get("last_active_drawing") or {}
             )
 
-            if clicked and "|" in clicked:
+            properties = (
+                active_feature.get("properties", {})
+                if isinstance(active_feature, dict)
+                else {}
+            )
 
-                name, alpha2, alpha3 = clicked.split("|", 2)
+            country = (
+                identify_country(properties)
+                if properties
+                else None
+            )
 
-                new_country = {
-                    "name": name,
-                    "alpha2": alpha2,
-                    "alpha3": alpha3
-                }
+            if country:
+                new_country = country
 
-                if new_country != st.session_state.selected_country:
+                if (
+                    new_country
+                    != st.session_state.selected_country
+                ):
                     st.session_state.selected_country = new_country
                     st.session_state.selected_region = None
                     st.session_state.show_ten = False
@@ -1018,7 +1005,8 @@ with right:
                     if len(local_trends) > 5:
 
                         if st.button(
-                            "Show top 5" if st.session_state.show_ten
+                            "Show top 5"
+                            if st.session_state.show_ten
                             else "Show top 10",
                             use_container_width=True
                         ):
